@@ -1,0 +1,117 @@
+import java.io.IOException;
+import java.io.Reader;
+import java.lang.ProcessBuilder.Redirect;
+
+import javax.swing.text.Segment;
+
+import org.gjt.sp.jedit.EBComponent;
+import org.gjt.sp.jedit.EBMessage;
+import org.gjt.sp.jedit.buffer.JEditBuffer;
+import org.gjt.sp.jedit.bufferio.BufferIORequest;
+import org.gjt.sp.jedit.bufferio.IoTask;
+import org.gjt.sp.jedit.io.Encoding;
+import org.gjt.sp.jedit.io.EncodingServer;
+import org.gjt.sp.jedit.msg.BufferUpdate;
+import org.gjt.sp.util.ThreadUtilities;
+import org.gjt.sp.jedit.bsh.BlockNameSpace;
+
+public class SaveThruProgram implements EBComponent {
+
+	private String[] cmd = new String[] { "C:\\Users\\thomas\\terraform_0.15.1_windows_amd64\\terraform", "fmt", "-" };
+
+	private static class ProcessWriter extends BufferIORequest {
+		private Process process;
+		public ProcessWriter(Process process, View view, Buffer buffer) {
+			super(view,buffer,null,buffer.getVFS(),buffer.getPath());
+			this.process = process;
+		}
+
+		public void _run() {
+			OutputStream out = process.getOutputStream();
+			try {
+				write(buffer, out);
+			} catch (Exception e) {
+				Log.log(Log.ERROR, this, e);
+			} finally {
+				out.close();
+			}
+		}
+	}
+
+	private static class ProcessReader extends BufferIORequest {
+		private Process process;
+		private SegmentBuffer segmentBuffer;
+		public ProcessReader(Process process, View view, Buffer buffer) {
+			super(view,buffer,null,buffer.getVFS(),buffer.getPath());
+			this.process = process;
+		}
+
+		public void _run() {
+			InputStream in = process.getInputStream();
+			try {
+				String encodingName = buffer.getStringProperty(JEditBuffer.ENCODING);
+				Encoding encoding = EncodingServer.getEncoding(encodingName);
+				Reader reader = encoding.getTextReader(in);
+				segmentBuffer = read(reader, buffer.getLength(), true);
+			} catch (Exception e) {
+				Log.log(Log.ERROR, this, e);
+			} finally {
+				in.close();
+			}
+		}
+		public SegmentBuffer getText() {
+			return segmentBuffer;
+		}
+	}
+
+	public void handleMessage(EBMessage message) {
+		if(!(message instanceof BufferUpdate)) {
+			return;
+		}
+
+		BufferUpdate bu = (BufferUpdate) message;
+		if(bu.getWhat() != BufferUpdate.SAVING) {
+			return;
+		}
+
+		Buffer buffer = bu.getBuffer();
+		if(buffer.isReadOnly()) {
+			return;
+		}
+
+		if(!buffer.getName().endsWith(".tf")) {
+			return;
+		}
+
+		View view = bu.getView();
+		pipeThruProgram(cmd, buffer, view);
+	}
+
+	public void pipeThruProgram(String[] cmd, Buffer buffer, View view) {
+		Log.log(Log.MESSAGE, this, "going to pipe buffer " + buffer + " thru " + java.util.Arrays.toString(cmd));
+		try {
+			ProcessBuilder pb = new ProcessBuilder(cmd);
+			pb.redirectError(Redirect.DISCARD);
+			Process process = pb.start();
+
+			IoTask outRunner = new ProcessWriter(process, view, buffer);
+			ProcessReader inRunner = new ProcessReader(process, view, buffer);
+			ThreadUtilities.runInBackground(outRunner);
+			ThreadUtilities.runInBackground(inRunner);
+
+			int exitCode = process.waitFor();
+
+			if(exitCode == 0) {
+				buffer.beginCompoundEdit();
+				buffer.remove(0, buffer.getLength());
+				buffer.insert(0, inRunner.getText());
+				buffer.endCompoundEdit();
+			}
+		} catch (Exception e) {
+			Log.log(Log.ERROR, this, e);
+		}
+	}
+}
+
+EditBus.addToBus(new SaveThruProgram());
+Log.log(Log.MESSAGE, this, "added to EditBus!");
